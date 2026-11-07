@@ -1,6 +1,7 @@
 //! Find a running Herdr agent session by what it's about, and focus its pane.
 //!
-//! The pipeline: a [`herdr::Multiplexer`] lists the agent panes; each
+//! The pipeline: a [`herdr::Multiplexer`] lists the agent panes (the Herdr
+//! TUI's, and herdr-core's terminals via [`hc`]); each
 //! [`sources::AgentSource`] maps its agent's live processes to panes (via
 //! [`procs::ProcessTable`]) and transcripts, and parses them; a
 //! [`rank::Ranker`] orders the sessions against a description; the
@@ -8,6 +9,7 @@
 
 pub mod config;
 pub mod finder;
+pub mod hc;
 pub mod herdr;
 pub mod mcp;
 pub mod procs;

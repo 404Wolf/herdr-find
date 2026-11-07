@@ -2,6 +2,8 @@
 //!
 //! Each running Claude Code writes `<config>/sessions/<pid>.json` naming its
 //! `sessionId`; the transcript is `<config>/projects/<project>/<sessionId>.jsonl`.
+//! Without that file, a `--resume <id>` / `--session-id <id>` argument names
+//! the session.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{AgentSource, Candidate};
+use super::{AgentSource, Candidate, runs};
 use crate::procs::ProcessTable;
 use crate::transcript::{Transcript, content_texts};
 
@@ -34,6 +36,35 @@ impl Claude {
             .max()
             .map(|(_, path)| path)
     }
+
+    /// The session a live process writes, per `<config>/sessions/<pid>.json`.
+    fn session_of_pid(&self, pid: u32, procs: &dyn ProcessTable) -> Option<String> {
+        let file = self.dir.join("sessions").join(format!("{pid}.json"));
+        let meta: SessionMeta = serde_json::from_slice(&fs::read(file).ok()?).ok()?;
+        // A stale file whose pid now belongs to another process.
+        if let (Some(want), Some(have)) = (&meta.proc_start, procs.start_time(meta.pid))
+            && *want != have
+        {
+            return None;
+        }
+        (meta.pid == pid).then_some(meta.session_id)
+    }
+}
+
+/// The session named on a Claude Code command line.
+pub fn session_arg(argv: &[String]) -> Option<String> {
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        for flag in ["--resume", "--session-id"] {
+            if let Some(value) = arg.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+                return Some(value.to_string());
+            }
+        }
+        if matches!(arg.as_str(), "--resume" | "-r" | "--session-id") {
+            return args.next().filter(|v| !v.starts_with('-')).cloned();
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -79,22 +110,29 @@ impl AgentSource for Claude {
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
             .filter_map(|e| {
-                let meta: SessionMeta = serde_json::from_slice(&fs::read(e.path()).ok()?).ok()?;
-                // A stale file whose pid now belongs to another process.
-                if let (Some(want), Some(have)) = (&meta.proc_start, procs.start_time(meta.pid))
-                    && *want != have
-                {
-                    return None;
-                }
-                let pane_id = procs.pane_of(meta.pid)?;
-                let path = self.transcript(&meta.session_id)?;
-                Some(Candidate {
-                    pid: meta.pid,
-                    pane_id,
-                    path,
-                })
+                let pid: u32 = e.path().file_stem()?.to_str()?.parse().ok()?;
+                let session = self.session_of_pid(pid, procs)?;
+                let pane_id = procs.pane_of(pid)?;
+                let path = self.transcript(&session)?;
+                Some(Candidate { pid, pane_id, path })
             })
             .collect()
+    }
+
+    fn is_agent(&self, argv: &[String]) -> bool {
+        runs(argv, "claude", "claude-code")
+    }
+
+    fn transcript_of_process(&self, pid: u32, procs: &dyn ProcessTable) -> Option<PathBuf> {
+        let session = self.session_of_pid(pid, procs).or_else(|| {
+            let argv = procs.cmdline(pid);
+            self.is_agent(&argv).then(|| session_arg(&argv)).flatten()
+        })?;
+        self.transcript(&session)
+    }
+
+    fn transcript_of_session(&self, session_id: &str) -> Option<PathBuf> {
+        self.transcript(session_id)
     }
 
     fn parse_line(&self, line: &str, out: &mut Transcript) {
@@ -210,8 +248,60 @@ mod tests {
             [Candidate {
                 pid: 10,
                 pane_id: "p_a".into(),
-                path: transcript
+                path: transcript.clone()
             }]
         );
+
+        // Per process: the sessions file, else the command line.
+        let source = Claude::new(&claude);
+        let procs = ProcFs::at(&proc);
+        assert_eq!(
+            source.transcript_of_process(10, &procs),
+            Some(transcript.clone())
+        );
+        assert_eq!(source.transcript_of_process(11, &procs), None);
+        fake::process(&proc, 14, 1, &[], &[]);
+        fake::cmdline(
+            &proc,
+            14,
+            &["/nix/store/x/bin/claude", "--resume", "sess-a"],
+        );
+        assert_eq!(
+            source.transcript_of_process(14, &procs),
+            Some(transcript.clone())
+        );
+        fake::process(&proc, 15, 1, &[], &[]);
+        fake::cmdline(&proc, 15, &["vim", "--resume", "sess-a"]);
+        assert_eq!(source.transcript_of_process(15, &procs), None);
+        assert_eq!(source.transcript_of_session("sess-a"), Some(transcript));
+        assert_eq!(source.transcript_of_session("nope"), None);
+    }
+
+    #[test]
+    fn reads_session_arguments() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            session_arg(&argv(&["claude", "--resume", "a"])).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            session_arg(&argv(&["claude", "-x", "--session-id=b"])).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            session_arg(&argv(&["claude", "-r", "c"])).as_deref(),
+            Some("c")
+        );
+        assert_eq!(session_arg(&argv(&["claude", "--resume"])), None);
+        assert_eq!(session_arg(&argv(&["claude", "--resume", "--model"])), None);
+        assert_eq!(session_arg(&argv(&["claude"])), None);
+        let c = Claude::new(Path::new("/"));
+        assert!(c.is_agent(&argv(&["/nix/store/x/libexec/claude", "--resume", "a"])));
+        assert!(c.is_agent(&argv(&[
+            "node",
+            "/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        ])));
+        assert!(!c.is_agent(&argv(&["bash", "-c", "claude"])));
+        assert!(!c.is_agent(&[]));
     }
 }

@@ -3,15 +3,18 @@
 //! A running Codex keeps its current rollout file open, so the transcript is
 //! whichever `<home>/sessions/**/rollout-*.jsonl` the process has open. As a
 //! fallback, Codex also holds `<home>/thread-writer-locks/<thread id>.lock`,
-//! and the rollout's file name ends in that thread id.
+//! and the rollout's file name ends in that thread id. Sub-agent threads
+//! write rollouts of their own from the same process; those (whose first-line
+//! `session_meta` has a `{"subagent": ...}` source) are not the session.
 
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{AgentSource, Candidate};
+use super::{AgentSource, Candidate, runs};
 use crate::procs::{ProcessTable, is_under};
 use crate::transcript::{Transcript, content_texts};
 
@@ -60,7 +63,7 @@ impl Codex {
     fn transcript_of(&self, open: Vec<PathBuf>) -> Option<PathBuf> {
         let newest = open
             .iter()
-            .filter(|p| self.is_rollout(p))
+            .filter(|p| self.is_rollout(p) && !is_subagent_rollout(p))
             .filter_map(|p| Some((fs::metadata(p).ok()?.modified().ok()?, p)))
             .max()
             .map(|(_, p)| p.clone());
@@ -79,6 +82,28 @@ impl Codex {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("rollout-"))
             && is_under(path, &self.sessions)
+    }
+}
+
+/// Whether a rollout belongs to a sub-agent thread, per its first line.
+pub fn is_subagent_rollout(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    // The first line carries the base instructions, so it can be long.
+    let mut line = String::new();
+    if BufReader::new(file.take(4 << 20))
+        .read_line(&mut line)
+        .is_err()
+    {
+        return false;
+    }
+    match serde_json::from_str::<Value>(&line) {
+        Ok(row) => {
+            row["type"] == "session_meta" && row["payload"]["source"].get("subagent").is_some()
+        }
+        // Cut short: fall back to the raw text.
+        Err(_) => line.contains(r#""source":{"subagent""#),
     }
 }
 
@@ -121,6 +146,22 @@ impl AgentSource for Codex {
                 })
             })
             .collect()
+    }
+
+    fn is_agent(&self, argv: &[String]) -> bool {
+        runs(argv, "codex", "codex")
+    }
+
+    fn transcript_of_process(&self, pid: u32, procs: &dyn ProcessTable) -> Option<PathBuf> {
+        self.transcript_of(procs.open_files(pid))
+    }
+
+    fn transcript_of_session(&self, session_id: &str) -> Option<PathBuf> {
+        if session_id.is_empty() || session_id.contains('/') {
+            return None;
+        }
+        self.rollout_of_thread(session_id)
+            .filter(|p| !is_subagent_rollout(p))
     }
 
     fn parse_line(&self, line: &str, out: &mut Transcript) {
@@ -216,9 +257,51 @@ mod tests {
                 Candidate {
                     pid: 23,
                     pane_id: "p_z".into(),
-                    path: locked
+                    path: locked.clone()
                 }
             ]
         );
+        let source = Codex::new(&home);
+        assert_eq!(source.transcript_of_session("def"), Some(locked));
+        assert_eq!(source.transcript_of_session("zzz"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_subagent_rollouts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, proc) = (tmp.path().join("codex"), tmp.path().join("proc"));
+        let day = home.join("sessions/2026/01/01");
+        fs::create_dir_all(&day).unwrap();
+        let main = day.join("rollout-2026-01-01T00-00-00-main.jsonl");
+        let sub = day.join("rollout-2026-01-01T00-00-01-sub.jsonl");
+        fs::write(
+            &main,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"source\":\"cli\"}}}}\n{FIXTURE}"),
+        )
+        .unwrap();
+        // Written after the main rollout, so it is the newest open file.
+        fs::write(
+            &sub,
+            r#"{"type":"session_meta","payload":{"source":{"subagent":{"thread_spawn":{"depth":1}}}}}"#,
+        )
+        .unwrap();
+        assert!(is_subagent_rollout(&sub));
+        assert!(!is_subagent_rollout(&main));
+        fake::process(&proc, 30, 1, &[("HERDR_PANE_ID", "p_s")], &[&main, &sub]);
+        let source = Codex::new(&home);
+        assert_eq!(
+            source.transcript_of_process(30, &ProcFs::at(&proc)),
+            Some(main)
+        );
+        assert_eq!(source.transcript_of_session("sub"), None);
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(source.is_agent(&argv(&["codex"])));
+        assert!(source.is_agent(&argv(&["/x/codex-x86_64-unknown-linux-musl", "resume"])));
+        assert!(source.is_agent(&argv(&[
+            "node",
+            "/lib/node_modules/@openai/codex/bin/codex.js"
+        ])));
+        assert!(!source.is_agent(&argv(&["claude"])));
     }
 }

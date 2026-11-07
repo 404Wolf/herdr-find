@@ -12,10 +12,13 @@ Usage:
   herdr-find find [--limit N] [--all] <description...>
                                         Rank running sessions against a description
   herdr-find list                       List running sessions
-  herdr-find focus <pane_id>            Switch the Herdr view to a pane
+  herdr-find focus <pane_id>            Switch the Herdr view to a pane (a TUI pane id,
+                                        or a herdr-core terminal address or name)
   herdr-find --help | --version
 
-`find` leaves out the pane herdr-find runs in (HERDR_PANE_ID) unless --all.
+Searches the Herdr TUI and herdr-core (shown in the Herdr app) side by side;
+HERDR_FIND_RUNTIMES=herdr or =core picks one. `find` leaves out the pane or
+terminal herdr-find runs in (HERDR_PANE_ID, HC_TERMINAL_ID) unless --all.
 Output is JSON.";
 
 fn main() -> ExitCode {
@@ -79,7 +82,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
         }
         Some("focus") => {
             let [_, pane] = args else {
-                anyhow::bail!("usage: herdr-find focus <pane_id>");
+                anyhow::bail!("usage: herdr-find focus <pane_id|terminal>");
             };
             finder().focus(pane)?;
             print(serde_json::json!({ "focused": pane }));

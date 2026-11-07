@@ -15,7 +15,7 @@ use crate::finder::{Finder, Match, SessionSummary};
 pub const DEFAULT_LIMIT: usize = 5;
 
 const INSTRUCTIONS: &str = "Finds the user's running Herdr coding-agent sessions \
-(Claude Code, Codex, ...) by what they are about and switches the user's view to one. \
+(Claude Code, Codex, ...; in the Herdr TUI or in herdr-core terminals shown by the Herdr app) by what they are about and switches the user's view to one. \
 When the user asks to go to, switch to, open, jump to or be taken to the Herdr \
 window/pane/tab/session/agent where some topic was discussed or worked on, call \
 find_herdr_session with that topic, pick the best match (ask if it's ambiguous), then \
@@ -35,7 +35,8 @@ pub struct FindArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FocusArgs {
-    /// The pane_id of a session from find_herdr_session or list_herdr_sessions.
+    /// The pane_id of a session from find_herdr_session or list_herdr_sessions
+    /// (a Herdr TUI pane id, or a herdr-core terminal address like `t7`).
     pub pane_id: String,
 }
 
@@ -93,7 +94,7 @@ impl Server {
 Use when the user asks to take them to, switch to, open, jump to or find the Herdr window, pane, tab or session \
 where they were chatting about / working on something, e.g. \"take me to the herdr window where we're \
 refactoring the config parser\". Searches pane titles, conversation summaries, workspace/tab names, working \
-directories and the sessions' transcripts, and returns the best matches (pane_id, title, workspace, tab, cwd, \
+directories and the sessions' transcripts, and returns the best matches (pane_id, runtime, title, workspace, tab, cwd, \
 score, matching snippet, first and recent prompts). The calling agent's own pane is excluded. Then call \
 focus_herdr_pane with the chosen pane_id; if the top matches are close or unconvincing, ask the user or use \
 list_herdr_sessions."
@@ -121,7 +122,8 @@ list_herdr_sessions."
 
     #[tool(
         name = "list_herdr_sessions",
-        description = "List every running Herdr agent session (Claude Code, Codex, ...) with its pane_id, status, \
+        description = "List every running Herdr agent session (Claude Code, Codex, ...; Herdr TUI panes and \
+herdr-core terminals) with its pane_id, runtime, status, \
 title, conversation summary, workspace, tab, working directory, first prompt and latest prompts. Use it to pick \
 the session the user means when find_herdr_session's keyword search doesn't find it, or when the user asks what \
 agents are running in Herdr."
@@ -139,8 +141,8 @@ agents are running in Herdr."
 
     #[tool(
         name = "focus_herdr_pane",
-        description = "Switch the user's Herdr view to an agent pane, including its workspace and tab: this is \
-how you \"take the user to\" a session. Pass a pane_id from find_herdr_session or list_herdr_sessions."
+        description = "Switch the user's Herdr view to an agent pane, including its workspace and tab (for a \
+herdr-core terminal, the Herdr app shows it): this is how you \"take the user to\" a session. Pass a pane_id from find_herdr_session or list_herdr_sessions."
     )]
     async fn focus_herdr_pane(
         &self,

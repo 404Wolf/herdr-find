@@ -9,8 +9,9 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::config::Config;
-use crate::herdr::{AgentPane, HerdrCli, Multiplexer, validate_pane_id};
-use crate::procs::{ProcFs, ProcessTable};
+use crate::hc::HerdrCore;
+use crate::herdr::{AgentPane, CORE, HerdrCli, Multiplexer, Runtimes, TUI, validate_pane_id};
+use crate::procs::{ProcFs, ProcessTable, Tree};
 use crate::rank::{KeywordRanker, Ranker, truncate};
 use crate::sources::{AgentSource, Candidate, default_sources};
 use crate::transcript::{HEAD_BYTES, TAIL_BYTES, Transcript, for_each_line};
@@ -31,8 +32,14 @@ pub struct Session {
 /// whole transcript.
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 pub struct SessionSummary {
-    /// Pass this to `focus_herdr_pane`.
+    /// Pass this to `focus_herdr_pane`: a Herdr TUI pane id, or a
+    /// herdr-core terminal address like `t7`.
     pub pane_id: String,
+    /// `herdr` (the Herdr TUI) or `herdr-core` (shown in the Herdr app).
+    pub runtime: String,
+    /// The herdr-core terminal's name, when it has one.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// Agent kind, e.g. `claude` or `codex`.
     pub agent: String,
     /// `idle`, `working`, `blocked`, `done` or `unknown`.
@@ -42,6 +49,7 @@ pub struct SessionSummary {
     /// Latest summary of the conversation, when the agent writes one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Workspace (TUI) or space (Herdr app).
     pub workspace: String,
     pub tab: String,
     pub cwd: String,
@@ -85,62 +93,91 @@ pub struct Finder {
     pub procs: Box<dyn ProcessTable>,
     pub sources: Vec<Box<dyn AgentSource>>,
     pub ranker: Box<dyn Ranker>,
-    /// The caller's own pane, flagged and left out of search results.
-    pub current_pane: Option<String>,
+    /// The caller's own pane(s) / terminal, flagged and left out of search
+    /// results.
+    pub current_panes: Vec<String>,
 }
 
 impl Finder {
-    /// The default setup: Herdr CLI, system procfs, all agent sources,
-    /// keyword ranking.
+    /// The default setup: the configured runtimes (Herdr TUI and
+    /// herdr-core), system procfs, all agent sources, keyword ranking.
     pub fn from_config(config: &Config) -> Self {
+        let runtimes = config
+            .runtimes
+            .iter()
+            .map(|r| -> (String, Box<dyn Multiplexer>) {
+                match r.as_str() {
+                    "core" => (
+                        CORE.into(),
+                        Box::new(HerdrCore::new(&config.hc_bin, &config.app_bin)),
+                    ),
+                    _ => (TUI.into(), Box::new(HerdrCli::new(&config.herdr_bin))),
+                }
+            })
+            .collect();
         Self {
-            mux: Box::new(HerdrCli::new(&config.herdr_bin)),
+            mux: Box::new(Runtimes::new(runtimes)),
             procs: match &config.proc_dir {
                 Some(dir) => Box::new(ProcFs::at(dir)),
                 None => Box::new(ProcFs::system()),
             },
             sources: default_sources(config),
             ranker: Box::new(KeywordRanker::default()),
-            current_pane: config.current_pane.clone(),
+            current_panes: config.current_panes.clone(),
         }
     }
 
     /// Notes about degraded results (e.g. no transcripts on this platform).
     pub fn warnings(&self) -> Vec<String> {
-        if self.procs.supported() {
-            Vec::new()
-        } else {
-            vec![
+        let mut out = self.mux.warnings();
+        if !self.procs.supported() {
+            out.push(
                 "Mapping panes to transcripts needs Linux /proc; searching titles, workspaces, tabs and directories only.".into(),
-            ]
+            );
         }
+        out
     }
 
     /// Every running agent session, transcripts attached where found.
     pub fn sessions(&self) -> Result<Vec<Session>> {
-        let panes = self.mux.agents()?;
+        let (core, tui): (Vec<AgentPane>, Vec<AgentPane>) = self
+            .mux
+            .agents()?
+            .into_iter()
+            .partition(|p| p.runtime == CORE);
         // Labels are nice to have; a failure here shouldn't sink the search.
         let workspaces = self.mux.workspaces().unwrap_or_default();
         let tabs = self.mux.tabs().unwrap_or_default();
-        let located = self.locate(&panes);
+        let located = self.locate(&tui);
+        let mut panes: Vec<(AgentPane, Option<PathBuf>)> = tui
+            .into_iter()
+            .map(|pane| {
+                let path = located
+                    .get(&(pane.agent.clone(), pane.pane_id.clone()))
+                    .cloned();
+                (pane, path)
+            })
+            .collect();
+        if !core.is_empty() {
+            let tree = Tree::new(self.procs.as_ref());
+            panes.extend(core.into_iter().filter_map(|mut pane| {
+                let path = self.resolve_terminal(&mut pane, &tree)?;
+                Some((pane, path))
+            }));
+        }
 
         let mut sessions: Vec<Session> = panes
             .into_iter()
-            .map(|pane| {
-                let transcript_path = located
-                    .get(&(pane.agent.clone(), pane.pane_id.clone()))
-                    .cloned();
-                Session {
-                    workspace: workspaces
-                        .get(&pane.workspace_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    tab: tabs.get(&pane.tab_id).cloned().unwrap_or_default(),
-                    is_current: self.current_pane.as_deref() == Some(pane.pane_id.as_str()),
-                    transcript_path,
-                    transcript: None,
-                    pane,
-                }
+            .map(|(pane, transcript_path)| Session {
+                workspace: workspaces
+                    .get(&pane.workspace_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                tab: tabs.get(&pane.tab_id).cloned().unwrap_or_default(),
+                is_current: self.current_panes.contains(&pane.pane_id),
+                transcript_path,
+                transcript: None,
+                pane,
             })
             .collect();
 
@@ -163,6 +200,64 @@ impl Finder {
             .iter()
             .find(|s| s.kind() == kind)
             .map(|s| s.as_ref())
+    }
+
+    /// For a herdr-core terminal, the agent running under its process (filling
+    /// in `pane.agent` when no label named it) and that agent's transcript.
+    /// `None` when the terminal runs no agent.
+    ///
+    /// An `agent.session` label wins; otherwise the outermost agent process
+    /// under the terminal's process is the agent. The walk doesn't enter
+    /// processes in a Herdr TUI pane (a TUI running inside the terminal).
+    fn resolve_terminal(&self, pane: &mut AgentPane, tree: &Tree) -> Option<Option<PathBuf>> {
+        let procs = self.procs.as_ref();
+        if let (Some(id), Some(source)) = (&pane.session_id, self.source(&pane.agent))
+            && let Some(path) = source.transcript_of_session(id)
+        {
+            return Some(Some(path));
+        }
+        let Some(root) = pane.pid else {
+            return (!pane.agent.is_empty()).then_some(None);
+        };
+        let tui_pane = procs.pane_of(root);
+        let pids: Vec<u32> = tree
+            .walk(root, |pid| procs.pane_of(pid) == tui_pane)
+            .into_iter()
+            .filter(|&pid| pid == root || procs.pane_of(pid) == tui_pane)
+            .collect();
+        let mut first_agent = None;
+        for &pid in &pids {
+            let argv = procs.cmdline(pid);
+            let sources = self
+                .sources
+                .iter()
+                .filter(|s| pane.agent.is_empty() || s.kind() == pane.agent);
+            for source in sources {
+                let path = source.transcript_of_process(pid, procs);
+                if path.is_some() || source.is_agent(&argv) {
+                    first_agent = Some((pid, source.as_ref(), path));
+                    break;
+                }
+            }
+            if first_agent.is_some() {
+                break;
+            }
+        }
+        let Some((pid, source, path)) = first_agent else {
+            // Labelled with a kind we can't see (yet): listed, no transcript.
+            return (!pane.agent.is_empty()).then_some(None);
+        };
+        pane.agent = source.kind().to_string();
+        if path.is_some() {
+            return Some(path);
+        }
+        // E.g. a wrapper whose child holds the transcript.
+        Some(
+            tree.walk(pid, |p| procs.pane_of(p) == tui_pane)
+                .into_iter()
+                .skip(1)
+                .find_map(|p| source.transcript_of_process(p, procs)),
+        )
     }
 
     /// (agent kind, pane id) → transcript, for the kinds present in `panes`.
@@ -269,6 +364,12 @@ fn summarize(s: &Session) -> SessionSummary {
     let user = t.map(|t| t.user.as_slice()).unwrap_or_default();
     SessionSummary {
         pane_id: s.pane.pane_id.clone(),
+        runtime: if s.pane.runtime.is_empty() {
+            TUI.into()
+        } else {
+            s.pane.runtime.clone()
+        },
+        name: s.pane.name.clone(),
         agent: s.pane.agent.clone(),
         status: s.pane.status.clone(),
         title: s.pane.title.clone(),
@@ -402,7 +503,10 @@ pub(crate) mod tests {
             codex_dir: codex,
             proc_dir: Some(proc),
             herdr_bin: "unused".into(),
-            current_pane: Some("p_self".into()),
+            hc_bin: "unused".into(),
+            app_bin: "unused".into(),
+            runtimes: vec!["herdr".into()],
+            current_panes: vec!["p_self".into()],
         };
         let mut finder = Finder::from_config(&config);
         finder.mux = Box::new(mux.clone());
@@ -477,6 +581,73 @@ pub(crate) mod tests {
         assert!(finder.focus("p_missing").is_err());
         assert!(finder.focus("--help").is_err());
         assert_eq!(*mux.focused.lock().unwrap(), ["p_thumbs"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_agents_under_herdr_core_terminals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut finder, _) = setup(tmp.path());
+        let proc = tmp.path().join("proc");
+        let rollout = tmp
+            .path()
+            .join("codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-x.jsonl");
+        // t1: shell → codex wrapper (node) → native codex holding the rollout.
+        fake::process(&proc, 200, 1, &[], &[]);
+        fake::process(&proc, 201, 200, &[], &[]);
+        fake::cmdline(
+            &proc,
+            201,
+            &["node", "/lib/node_modules/@openai/codex/bin/codex.js"],
+        );
+        fake::process(&proc, 202, 201, &[], &[&rollout]);
+        fake::cmdline(&proc, 202, &["codex-x86_64-unknown-linux-musl"]);
+        // t2: labelled with its session; the label wins over the process.
+        fake::process(&proc, 210, 1, &[], &[]);
+        fake::cmdline(&proc, 210, &["claude", "--resume", "sess-self"]);
+        // t3: a plain shell.
+        fake::process(&proc, 220, 1, &[], &[]);
+        fake::cmdline(&proc, 220, &["bash"]);
+        // t4: a Herdr TUI running inside the terminal: its pane's claude is
+        // the TUI's, not this terminal's.
+        fake::process(&proc, 230, 1, &[], &[]);
+        fake::process(&proc, 231, 230, &[("HERDR_PANE_ID", "p_inner")], &[]);
+        fake::cmdline(&proc, 231, &["claude", "--resume", "sess-parser"]);
+        // t5: claude that hasn't written a transcript yet.
+        fake::process(&proc, 240, 1, &[], &[]);
+        fake::cmdline(&proc, 240, &["claude"]);
+
+        let term = |id: &str, pid: u32, labels: Option<(&str, &str)>| AgentPane {
+            pane_id: id.into(),
+            runtime: CORE.into(),
+            pid: Some(pid),
+            agent: labels.map(|l| l.0.to_string()).unwrap_or_default(),
+            session_id: labels.map(|l| l.1.to_string()),
+            ..Default::default()
+        };
+        finder.mux = Box::new(MockMux {
+            panes: vec![
+                term("t1", 200, None),
+                term("t2", 210, Some(("claude", "sess-parser"))),
+                term("t3", 220, None),
+                term("t4", 230, None),
+                term("t5", 240, None),
+            ],
+            ..Default::default()
+        });
+        let list = finder.list().unwrap();
+        let ids: Vec<&str> = list.iter().map(|s| s.pane_id.as_str()).collect();
+        assert_eq!(ids, ["t1", "t2", "t5"]);
+        assert_eq!(list[0].agent, "codex");
+        assert_eq!(list[0].runtime, "herdr-core");
+        assert_eq!(list[0].first_prompt, "Speed up the image thumbnail cache");
+        assert_eq!(list[1].agent, "claude");
+        assert_eq!(
+            list[1].first_prompt,
+            "Let's refactor the config parser so it handles nested tables"
+        );
+        assert_eq!(list[2].agent, "claude");
+        assert!(!list[2].has_transcript);
     }
 
     #[test]

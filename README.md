@@ -6,9 +6,23 @@ An [MCP](https://modelcontextprotocol.io) server that takes you to a running
 > "Take me to the herdr window where we're refactoring the config parser."
 
 Any coding agent with this server attached can answer that. `herdr-find`
-lists every agent pane Herdr knows about (Claude Code, Codex, ...), finds the
-transcript behind each one, ranks them against the description, and focuses
-the chosen pane with `herdr agent focus`.
+lists every agent session Herdr knows about (Claude Code, Codex, ...), finds
+the transcript behind each one, ranks them against the description, and
+focuses the chosen one.
+
+It works with both Herdr runtimes, side by side:
+
+- the **Herdr TUI** (`herdr`): agent panes from `herdr agent list`, focused
+  with `herdr agent focus`;
+- **herdr-core** (`hc`) with the **Herdr app**: terminals from `hc`'s
+  `terminal.list` (over `hc connect`), shown with
+  `herdr-app do agent.focus --terminal t7` (or `terminal.peek` for a terminal
+  the app has no pane for).
+
+Each session says which `runtime` it came from (`herdr` or `herdr-core`). For
+herdr-core, `pane_id` is the terminal address (`t7`); `focus` also takes the
+terminal's name. If one runtime isn't running, the other's sessions are still
+returned, with a warning.
 
 ## Tools
 
@@ -25,11 +39,12 @@ Each session is summarised as `pane_id`, `agent`, `status`, `title`,
 the best-matching `snippet`. Prompts and snippets are cut short. Whole
 transcripts are never returned.
 
-The calling agent's own pane (its `HERDR_PANE_ID`) is left out of
-`find_herdr_session`, because its transcript contains the request itself.
+The calling agent's own pane or terminal (its `HERDR_PANE_ID` or
+`HC_TERMINAL_ID`) is left out of `find_herdr_session`, because its transcript
+contains the request itself.
 
-Results come back as structured content plus the same JSON as text. When Herdr
-isn't reachable, the tools return errors instead of crashing.
+Results come back as structured content plus the same JSON as text. When no
+Herdr runtime is reachable, the tools return errors instead of crashing.
 
 ## How panes map to transcripts
 
@@ -46,7 +61,20 @@ pane, so every agent process carries its pane id in `/proc/<pid>/environ`.
   holds.
 
 If an agent was started from inside another agent's pane, the outermost
-process wins. Transcripts can be huge, so only the first 256 KiB (for the
+process wins.
+
+**herdr-core terminals** are matched by process tree instead: the agent is
+the outermost Claude Code / Codex process under the terminal's `pid`
+(recognised by its command line, a sessions file or an open rollout), and its
+transcript is found as above, falling back to Claude Code's
+`--resume <id>` / `--session-id <id>` argument. Labels win when present:
+`agent.kind=claude|codex` names the agent and `agent.session=<id>` its
+session (Codex: the thread id at the end of the rollout's name). The walk
+doesn't descend into processes of a Herdr TUI pane running inside the
+terminal. Codex rollouts of sub-agent threads (first-line `session_meta`
+with a `{"subagent": ...}` source) are never taken for the session. Space and
+tab names come from `herdr-app ls`, else from the `where` label the app sets.
+Terminals on other machines (`vps/t7`) are listed only when labelled. Transcripts can be huge, so only the first 256 KiB (for the
 opening prompt) and the last 4 MiB (recent context) are read. Only human
 prompts, assistant prose and conversation titles are used. Tool calls, tool
 output, thinking and injected harness text (`<command-name>`,
@@ -131,7 +159,7 @@ With Cargo: `cargo install --git https://github.com/404wolf/herdr-find`.
 herdr-find                        # serve MCP on stdio (same as `herdr-find mcp`)
 herdr-find find "config parser"   # rank sessions; --limit N, --all to include this pane
 herdr-find list                   # list sessions
-herdr-find focus <pane_id>        # focus a pane
+herdr-find focus <pane_id>        # focus a TUI pane, or a herdr-core terminal (t7 or its name)
 ```
 
 Output is JSON.
@@ -142,6 +170,10 @@ Output is JSON.
 |---|---|---|
 | `HERDR_BIN_PATH` | `herdr` on `PATH` | Herdr binary. Herdr exports this itself; a trailing ` (deleted)` is stripped. |
 | `HERDR_PANE_ID` | none | The caller's pane, which `find` leaves out. Herdr sets this. |
+| `HC_BIN_PATH` | `hc` on `PATH` | herdr-core CLI. |
+| `HERDR_APP_BIN_PATH` | `herdr-app` on `PATH` | Herdr app CLI. |
+| `HC_TERMINAL_ID` | none | The caller's herdr-core terminal, which `find` leaves out. herdr-core sets this. |
+| `HERDR_FIND_RUNTIMES` | `herdr,core` | Which runtimes to search: `herdr` (TUI), `core` (herdr-core), or both. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code config dir. |
 | `CODEX_HOME` | `~/.codex` | Codex home. |
 | `HERDR_FIND_CLAUDE_DIR` | none | Overrides `CLAUDE_CONFIG_DIR` for `herdr-find` only. |
@@ -158,19 +190,26 @@ pub trait AgentSource: Send + Sync {
     fn kind(&self) -> &str;
     /// Live processes of this agent → (pid, pane id, transcript path).
     fn locate(&self, procs: &dyn ProcessTable) -> Vec<Candidate>;
+    /// Whether a command line is this agent's process (herdr-core).
+    fn is_agent(&self, argv: &[String]) -> bool;
+    /// The transcript one live process writes (herdr-core).
+    fn transcript_of_process(&self, pid: u32, procs: &dyn ProcessTable) -> Option<PathBuf>;
+    /// The transcript of a session id from an `agent.session` label.
+    fn transcript_of_session(&self, session_id: &str) -> Option<PathBuf>;
     /// Fold one JSONL line into the transcript (titles, prompts, replies).
     fn parse_line(&self, line: &str, out: &mut Transcript);
 }
 ```
 
 Register it with one line in `default_sources` in `src/sources/mod.rs`.
-`ProcessTable` gives you `pane_of(pid)`, `open_files(pid)`, `env_var` and
-`start_time`. `Transcript::push_user` already filters out injected harness
+`ProcessTable` gives you `pane_of(pid)`, `open_files(pid)`, `cmdline(pid)`,
+`env_var` and `start_time`. `Transcript::push_user` already filters out injected harness
 text.
 
 The other seams are traits as well. `Multiplexer` covers listing panes,
-workspaces and tabs and focusing a pane (`HerdrCli` implements it, and the
-tests use a mock). `Ranker` covers ordering sessions (`KeywordRanker`).
+workspaces and tabs and focusing a pane (`HerdrCli` for the TUI, `HerdrCore`
+for herdr-core and the app, `Runtimes` for several at once; the tests use a
+mock). `Ranker` covers ordering sessions (`KeywordRanker`).
 
 ## Development
 

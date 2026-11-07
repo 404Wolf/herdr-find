@@ -20,6 +20,8 @@ pub trait ProcessTable: Send + Sync {
     fn start_time(&self, pid: u32) -> Option<String>;
     /// Parent process id.
     fn parent(&self, pid: u32) -> Option<u32>;
+    /// Command line (`argv`); empty when unknown.
+    fn cmdline(&self, pid: u32) -> Vec<String>;
 
     /// The Herdr pane a process runs in.
     fn pane_of(&self, pid: u32) -> Option<String> {
@@ -119,6 +121,60 @@ impl ProcessTable for ProcFs {
         // ppid is field 4.
         self.stat_fields(pid)?.get(4 - 3)?.parse().ok()
     }
+
+    fn cmdline(&self, pid: u32) -> Vec<String> {
+        if !self.supported {
+            return Vec::new();
+        }
+        let Ok(raw) = fs::read(self.dir(pid).join("cmdline")) else {
+            return Vec::new();
+        };
+        raw.split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect()
+    }
+}
+
+/// Process ids to their children, for walking process trees.
+#[derive(Debug, Default)]
+pub struct Tree {
+    children: std::collections::HashMap<u32, Vec<u32>>,
+}
+
+impl Tree {
+    /// Snapshot the parent links of every visible process.
+    pub fn new(procs: &dyn ProcessTable) -> Self {
+        let mut children: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+        for pid in procs.pids() {
+            if let Some(ppid) = procs.parent(pid) {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+        children.values_mut().for_each(|c| c.sort_unstable());
+        Self { children }
+    }
+
+    /// `root` and its descendants, breadth first (outer processes first).
+    /// `descend` decides whether to look below a process.
+    pub fn walk(&self, root: u32, mut descend: impl FnMut(u32) -> bool) -> Vec<u32> {
+        let mut out = vec![root];
+        let mut seen = std::collections::HashSet::from([root]);
+        let mut i = 0;
+        while i < out.len() {
+            let pid = out[i];
+            i += 1;
+            if pid != root && !descend(pid) {
+                continue;
+            }
+            for &child in self.children.get(&pid).into_iter().flatten() {
+                if seen.insert(child) {
+                    out.push(child);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Whether `path` lies under `dir`, also comparing against `dir`'s canonical
@@ -135,6 +191,15 @@ pub(crate) mod fake {
     //! Build a fake procfs on disk for tests.
     use std::fs;
     use std::path::Path;
+
+    /// Give `<root>/<pid>` a command line.
+    pub fn cmdline(root: &Path, pid: u32, argv: &[&str]) {
+        let raw: Vec<u8> = argv
+            .iter()
+            .flat_map(|a| format!("{a}\0").into_bytes())
+            .collect();
+        fs::write(root.join(pid.to_string()).join("cmdline"), raw).unwrap();
+    }
 
     /// Create `<root>/<pid>` with an environ, a stat line and open files.
     pub fn process(root: &Path, pid: u32, ppid: u32, env: &[(&str, &str)], open: &[&Path]) {
@@ -189,5 +254,20 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(procs.open_files(42), vec![file]);
         assert_eq!(procs.pane_of(43), None);
+        assert!(procs.cmdline(42).is_empty());
+        fake::cmdline(tmp.path(), 42, &["claude", "--resume", "x"]);
+        assert_eq!(procs.cmdline(42), ["claude", "--resume", "x"]);
+    }
+
+    #[test]
+    fn walks_process_trees_outer_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (pid, ppid) in [(10, 1), (11, 10), (12, 10), (13, 11), (20, 1)] {
+            fake::process(tmp.path(), pid, ppid, &[], &[]);
+        }
+        let tree = Tree::new(&ProcFs::at(tmp.path()));
+        assert_eq!(tree.walk(10, |_| true), [10, 11, 12, 13]);
+        assert_eq!(tree.walk(10, |p| p != 11), [10, 11, 12]);
+        assert_eq!(tree.walk(99, |_| true), [99]);
     }
 }

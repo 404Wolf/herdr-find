@@ -213,10 +213,12 @@ struct Fields {
 impl KeywordRanker {
     fn fields(&self, s: &Session) -> Fields {
         let t = s.transcript.as_ref();
-        let titles = std::iter::once(s.pane.title.as_str()).chain(
-            t.into_iter()
-                .flat_map(|t| t.titles.iter().map(String::as_str)),
-        );
+        let titles = [s.pane.title.as_str(), s.pane.name.as_str()]
+            .into_iter()
+            .chain(
+                t.into_iter()
+                    .flat_map(|t| t.titles.iter().map(String::as_str)),
+            );
         let place = [
             s.workspace.as_str(),
             s.tab.as_str(),

@@ -1,8 +1,14 @@
 //! The terminal multiplexer: listing agent panes and focusing one.
+//!
+//! Two runtimes can run side by side: the Herdr TUI ([`HerdrCli`], panes in
+//! tabs in workspaces) and herdr-core with the Herdr app
+//! ([`crate::hc::HerdrCore`], terminals shown in the app's spaces and tabs).
+//! [`Runtimes`] lists both and focuses through whichever owns a pane.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -32,11 +38,35 @@ pub struct AgentPane {
     /// Whether this pane has focus in the UI.
     #[serde(default)]
     pub focused: bool,
+    /// Which runtime owns it: `herdr` (the TUI) or `herdr-core`.
+    #[serde(default = "tui")]
+    pub runtime: String,
+    /// The terminal's name, when it has one (herdr-core).
+    #[serde(default)]
+    pub name: String,
+    /// The process the terminal runs, to find the agent under it
+    /// (herdr-core; the TUI maps processes through `HERDR_PANE_ID`).
+    #[serde(skip)]
+    pub pid: Option<u32>,
+    /// The agent's session id, when the terminal is labelled with it.
+    #[serde(skip)]
+    pub session_id: Option<String>,
+}
+
+/// The Herdr TUI's runtime name.
+pub const TUI: &str = "herdr";
+/// herdr-core's runtime name.
+pub const CORE: &str = "herdr-core";
+
+fn tui() -> String {
+    TUI.into()
 }
 
 /// What `herdr-find` needs from a terminal multiplexer.
 pub trait Multiplexer: Send + Sync {
-    /// Every pane running a coding agent.
+    /// Every pane running a coding agent. A herdr-core runtime may also
+    /// return terminals whose agent is not known yet (`agent` empty, `pid`
+    /// set); the finder looks for an agent under them.
     fn agents(&self) -> Result<Vec<AgentPane>>;
     /// Workspace id → label.
     fn workspaces(&self) -> Result<HashMap<String, String>>;
@@ -44,6 +74,106 @@ pub trait Multiplexer: Send + Sync {
     fn tabs(&self) -> Result<HashMap<String, String>>;
     /// Switch the user's view to a pane.
     fn focus(&self, pane_id: &str) -> Result<()>;
+    /// Notes about runtimes that couldn't be reached on the last listing.
+    fn warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Several runtimes side by side (the Herdr TUI and herdr-core during the
+/// migration). Listing merges them; one failing only adds a warning unless
+/// all fail. Focus goes to whichever runtime lists the pane.
+pub struct Runtimes {
+    runtimes: Vec<(String, Box<dyn Multiplexer>)>,
+    failures: Mutex<Vec<String>>,
+}
+
+impl Runtimes {
+    pub fn new(runtimes: Vec<(String, Box<dyn Multiplexer>)>) -> Self {
+        Self {
+            runtimes,
+            failures: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn merged<T>(
+        &self,
+        get: impl Fn(&dyn Multiplexer) -> Result<T>,
+        mut add: impl FnMut(T),
+    ) -> Result<()> {
+        let mut errors = Vec::new();
+        for (name, mux) in &self.runtimes {
+            match get(mux.as_ref()) {
+                Ok(items) => add(items),
+                Err(e) => errors.push(format!("{name}: {e:#}")),
+            }
+        }
+        if !self.runtimes.is_empty() && errors.len() == self.runtimes.len() {
+            bail!("no Herdr runtime reachable: {}", errors.join("; "));
+        }
+        Ok(())
+    }
+}
+
+impl Multiplexer for Runtimes {
+    fn agents(&self) -> Result<Vec<AgentPane>> {
+        let mut all = Vec::new();
+        let mut failures = Vec::new();
+        for (name, mux) in &self.runtimes {
+            match mux.agents() {
+                Ok(panes) => all.extend(panes),
+                Err(e) => failures.push(format!("{name} not reachable: {e:#}")),
+            }
+        }
+        if !self.runtimes.is_empty() && failures.len() == self.runtimes.len() {
+            bail!("no Herdr runtime reachable: {}", failures.join("; "));
+        }
+        *self.failures.lock().unwrap() = failures;
+        Ok(all)
+    }
+
+    fn workspaces(&self) -> Result<HashMap<String, String>> {
+        let mut all = HashMap::new();
+        self.merged(|m| m.workspaces(), |w| all.extend(w))?;
+        Ok(all)
+    }
+
+    fn tabs(&self) -> Result<HashMap<String, String>> {
+        let mut all = HashMap::new();
+        self.merged(|m| m.tabs(), |t| all.extend(t))?;
+        Ok(all)
+    }
+
+    fn focus(&self, pane_id: &str) -> Result<()> {
+        validate_pane_id(pane_id)?;
+        let owner = self.runtimes.iter().find(|(_, mux)| {
+            mux.agents().is_ok_and(|panes| {
+                panes
+                    .iter()
+                    .any(|p| p.pane_id == pane_id || (!p.name.is_empty() && p.name == pane_id))
+            })
+        });
+        if let Some((_, mux)) = owner {
+            return mux.focus(pane_id);
+        }
+        // Not listed anywhere (finished, or a runtime is down): let each try.
+        let mut errors = Vec::new();
+        for (name, mux) in &self.runtimes {
+            match mux.focus(pane_id) {
+                Ok(()) => return Ok(()),
+                Err(e) => errors.push(format!("{name}: {e:#}")),
+            }
+        }
+        bail!("could not focus {pane_id:?}: {}", errors.join("; "))
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        let mut out = self.failures.lock().unwrap().clone();
+        for (_, mux) in &self.runtimes {
+            out.extend(mux.warnings());
+        }
+        out
+    }
 }
 
 /// Herdr, driven through its CLI.
@@ -113,13 +243,49 @@ impl HerdrCli {
 
     /// Run herdr and return its stdout; errors carry herdr's stderr.
     fn run(&self, args: &[&str]) -> Result<String> {
-        let mut child = Command::new(&self.bin)
+        run_command(&self.bin, args, None, self.timeout)
+    }
+
+    fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T> {
+        let out = self.run(args)?;
+        let envelope: Envelope<T> = serde_json::from_str(&out)
+            .with_context(|| format!("unexpected output from `herdr {}`", args.join(" ")))?;
+        Ok(envelope.result)
+    }
+}
+
+/// Run a program with a deadline and return its stdout; errors carry its
+/// stderr. `input` is written to its stdin, which is then closed.
+pub(crate) fn run_command(
+    bin: &str,
+    args: &[&str],
+    input: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let name = std::path::Path::new(bin)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(bin)
+        .to_string();
+    {
+        let mut child = Command::new(bin)
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("could not run `{}`", self.bin))?;
+            .with_context(|| format!("could not run `{bin}`"))?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            let input = input.to_string();
+            thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(input.as_bytes());
+            });
+        }
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
         let out = thread::spawn(move || {
@@ -131,7 +297,7 @@ impl HerdrCli {
             let _ = stderr.read_to_string(&mut s);
             s
         });
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -139,7 +305,7 @@ impl HerdrCli {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("`herdr {}` timed out", args.join(" "));
+                bail!("`{name} {}` timed out", args.join(" "));
             }
             thread::sleep(Duration::from_millis(10));
         };
@@ -148,20 +314,15 @@ impl HerdrCli {
             .map_err(|_| anyhow!("stdout reader panicked"))??;
         let stderr = err.join().unwrap_or_default();
         if !status.success() {
-            bail!(
-                "`herdr {}` failed ({status}): {}",
-                args.join(" "),
+            // Some tools report errors as JSON on stdout.
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
                 stderr.trim()
-            );
+            };
+            bail!("`{name} {}` failed ({status}): {detail}", args.join(" "));
         }
         Ok(stdout)
-    }
-
-    fn json<T: DeserializeOwned>(&self, args: &[&str]) -> Result<T> {
-        let out = self.run(args)?;
-        let envelope: Envelope<T> = serde_json::from_str(&out)
-            .with_context(|| format!("unexpected output from `herdr {}`", args.join(" ")))?;
-        Ok(envelope.result)
     }
 }
 
@@ -224,6 +385,8 @@ mod tests {
                 tab_id: "t_1".into(),
                 title: "Parser work".into(),
                 focused: true,
+                runtime: TUI.into(),
+                ..Default::default()
             }]
         );
         let tabs: Envelope<Tabs> = serde_json::from_str(
